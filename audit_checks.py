@@ -13,7 +13,7 @@ class AuditConfig:
     amount_tolerance: float = 0.01
     max_examples: int = 30
     strict_schema: bool = False
-    compare_only_common_fields: bool = True  # ✅ new
+    compare_only_common_fields: bool = True
 
 
 @dataclass
@@ -34,16 +34,31 @@ class AuditResult:
     warning_checks: List[CheckFinding] = field(default_factory=list)
     recomputed_summary: Optional[Dict[str, Any]] = None
     recomputed_monthly_summary: Optional[List[Dict[str, Any]]] = None
+    normalization_notes: List[str] = field(default_factory=list)
 
-    # ✅ new: structured monthly comparison outputs
     monthly_value_mismatches: List[Dict[str, Any]] = field(default_factory=list)
     monthly_missing_fields: List[Dict[str, Any]] = field(default_factory=list)
     monthly_overview: List[Dict[str, Any]] = field(default_factory=list)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+TRANSACTION_FIELD_ALIASES = {
+    "date": ["date", "transaction_date", "posting_date", "posted_date", "value_date", "txn_date"],
+    "description": ["description", "transaction_description", "narration", "remarks", "details", "memo"],
+    "debit": ["debit", "withdrawal", "debit_amount", "money_out", "outflow", "amount_out"],
+    "credit": ["credit", "deposit", "credit_amount", "money_in", "inflow", "amount_in"],
+    "amount": ["amount", "transaction_amount", "amt"],
+    "type": ["type", "transaction_type", "dr_cr", "direction", "entry_type"],
+}
+
+MONTHLY_FIELD_ALIASES = {
+    "month": ["month", "period", "month_key", "year_month", "statement_month"],
+    "transaction_count": ["transaction_count", "count", "txn_count", "no_of_transactions"],
+    "total_debit": ["total_debit", "debit_total", "sum_debit", "withdrawal_total", "total_withdrawal"],
+    "total_credit": ["total_credit", "credit_total", "sum_credit", "deposit_total", "total_deposit"],
+    "net_change": ["net_change", "net", "net_flow", "balance_change", "net_movement"],
+}
+
+
 def _parse_date_safe(x: Any) -> Optional[datetime]:
     if x is None:
         return None
@@ -71,6 +86,11 @@ def _float_or_nan(x: Any) -> float:
     try:
         if x is None or (isinstance(x, str) and x.strip() == ""):
             return float("nan")
+        if isinstance(x, str):
+            cleaned = x.replace(",", "").replace("RM", "").replace("$", "").strip()
+            if cleaned.startswith("(") and cleaned.endswith(")"):
+                cleaned = f"-{cleaned[1:-1]}"
+            return float(cleaned)
         return float(x)
     except Exception:
         return float("nan")
@@ -94,6 +114,117 @@ def _round2(x: Any) -> Optional[float]:
         return None
 
 
+def _first_present(row: Dict[str, Any], aliases: List[str]) -> Any:
+    for name in aliases:
+        if name in row and row[name] is not None:
+            return row[name]
+    return None
+
+
+def _normalize_transaction_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    notes: List[str] = []
+    normalized = {
+        "date": _first_present(row, TRANSACTION_FIELD_ALIASES["date"]),
+        "description": _first_present(row, TRANSACTION_FIELD_ALIASES["description"]),
+        "debit": _first_present(row, TRANSACTION_FIELD_ALIASES["debit"]),
+        "credit": _first_present(row, TRANSACTION_FIELD_ALIASES["credit"]),
+    }
+
+    amount = _first_present(row, TRANSACTION_FIELD_ALIASES["amount"])
+    tx_type = _first_present(row, TRANSACTION_FIELD_ALIASES["type"])
+
+    if normalized["debit"] is None and normalized["credit"] is None and amount is not None:
+        amount_val = _float_or_nan(amount)
+        direction = str(tx_type).strip().lower() if tx_type is not None else ""
+        if math.isfinite(amount_val):
+            if direction in {"debit", "dr", "withdrawal", "out", "outflow"}:
+                normalized["debit"] = abs(amount_val)
+                normalized["credit"] = 0.0
+                notes.append("Derived debit/credit from single amount + transaction type.")
+            elif direction in {"credit", "cr", "deposit", "in", "inflow"}:
+                normalized["debit"] = 0.0
+                normalized["credit"] = abs(amount_val)
+                notes.append("Derived debit/credit from single amount + transaction type.")
+            else:
+                if amount_val < 0:
+                    normalized["debit"] = abs(amount_val)
+                    normalized["credit"] = 0.0
+                else:
+                    normalized["debit"] = 0.0
+                    normalized["credit"] = amount_val
+                notes.append("Derived debit/credit from signed single amount.")
+
+    return normalized, notes
+
+
+def _normalize_transactions(rows: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+    if not isinstance(rows, list):
+        return [], ["Input transactions is not a list; treated as empty."]
+
+    out: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized, row_notes = _normalize_transaction_row(row)
+        out.append(normalized)
+        notes.extend(row_notes)
+
+    unique_notes = sorted(set(notes))
+    return out, unique_notes
+
+
+def _normalize_month_key(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    dt = _parse_date_safe(value)
+    if dt:
+        return _month_key(dt)
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    month_formats = ["%Y-%m", "%Y/%m", "%b %Y", "%B %Y", "%Y%m"]
+    for fmt in month_formats:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m")
+        except ValueError:
+            continue
+
+    return s
+
+
+def _normalize_monthly_rows(rows: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
+    if not isinstance(rows, list):
+        return [], ["Input monthly_summary is not a list; treated as empty."]
+
+    notes: List[str] = []
+    normalized: List[Dict[str, Any]] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        normalized_row: Dict[str, Any] = {}
+        for field, aliases in MONTHLY_FIELD_ALIASES.items():
+            val = _first_present(row, aliases)
+            if field == "month":
+                normalized_row[field] = _normalize_month_key(val)
+            else:
+                normalized_row[field] = val
+
+        if normalized_row.get("month"):
+            normalized.append(normalized_row)
+
+        if any(alias in row for alias in ["period", "year_month", "statement_month"]):
+            notes.append("Mapped alternate monthly period keys to `month`.")
+        if any(alias in row for alias in ["txn_count", "count", "no_of_transactions"]):
+            notes.append("Mapped alternate monthly transaction count keys.")
+
+    return normalized, sorted(set(notes))
+
+
 def _index_by_month(rows: Any) -> Dict[str, Dict[str, Any]]:
     if not isinstance(rows, list):
         return {}
@@ -104,9 +235,6 @@ def _index_by_month(rows: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
-# -----------------------------
-# Recompute monthly from transactions
-# -----------------------------
 def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     df = pd.DataFrame(transactions)
     if df.empty:
@@ -135,36 +263,27 @@ def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[D
     df_valid["__month"] = df_valid["__date"].apply(_month_key)
 
     rows: List[Dict[str, Any]] = []
-    for m, g in df_valid.groupby("__month", sort=True):
-        d = float(pd.Series(g["__debit"]).fillna(0.0).sum())
-        c = float(pd.Series(g["__credit"]).fillna(0.0).sum())
+    for month, group in df_valid.groupby("__month", sort=True):
+        debit = float(pd.Series(group["__debit"]).fillna(0.0).sum())
+        credit = float(pd.Series(group["__credit"]).fillna(0.0).sum())
         rows.append(
             {
-                "month": m,
-                "transaction_count": int(len(g)),
-                "total_debit": round(d, 2),
-                "total_credit": round(c, 2),
-                "net_change": round(c - d, 2),
+                "month": month,
+                "transaction_count": int(len(group)),
+                "total_debit": round(debit, 2),
+                "total_credit": round(credit, 2),
+                "net_change": round(credit - debit, 2),
             }
         )
 
     return summary, rows
 
 
-# -----------------------------
-# Monthly comparison (clarity-first)
-# -----------------------------
 def compare_monthly_summary(
     provided_rows: Any,
     recomputed_rows: List[Dict[str, Any]],
     cfg: AuditConfig,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Returns:
-      - value_mismatches: REAL mismatches (numbers differ)
-      - missing_fields: schema gaps (field absent in provided)
-      - overview: one row per month with a human summary
-    """
     prov = _index_by_month(provided_rows)
     reco = _index_by_month(recomputed_rows)
 
@@ -175,17 +294,17 @@ def compare_monthly_summary(
     missing_fields: List[Dict[str, Any]] = []
     overview: List[Dict[str, Any]] = []
 
-    for m in months:
-        pr = prov.get(m) or {}
-        rr = reco.get(m) or {}
+    for month in months:
+        pr = prov.get(month) or {}
+        rr = reco.get(month) or {}
 
         if not pr and rr:
             overview.append(
                 {
-                    "month": m,
+                    "month": month,
                     "status": "MISSING_MONTH_IN_PROVIDED",
                     "summary": "Provided monthly_summary has no row for this month.",
-                    "action": "Your bank app did not output this month in monthly_summary. Check month grouping logic.",
+                    "action": "Check monthly grouping in upstream JSON output.",
                 }
             )
             continue
@@ -193,44 +312,42 @@ def compare_monthly_summary(
         if pr and not rr:
             overview.append(
                 {
-                    "month": m,
+                    "month": month,
                     "status": "MISSING_MONTH_IN_RECOMPUTED",
-                    "summary": "No transactions found for this month (recomputed side missing).",
-                    "action": "Either transactions are missing dates or month extraction failed.",
+                    "summary": "No transactions found for this month in recomputed side.",
+                    "action": "Check transaction dates or parsing in source data.",
                 }
             )
             continue
 
-        # both exist
         missing = []
         mism = []
 
-        for f in computed_fields:
-            pv = pr.get(f, None)
-            rv = rr.get(f, None)
+        for field in computed_fields:
+            pv = pr.get(field, None)
+            rv = rr.get(field, None)
 
             if pv is None:
-                missing.append(f)
+                missing.append(field)
                 missing_fields.append(
                     {
-                        "month": m,
-                        "field": f,
-                        "meaning": "This field is not present in provided monthly_summary (schema gap).",
+                        "month": month,
+                        "field": field,
+                        "meaning": "Field absent in provided monthly_summary (schema gap).",
                         "recomputed_value": rv,
-                        "action": "Either add this field to monthly_summary output OR enable compare_only_common_fields.",
+                        "action": "Add this field upstream or enable compare_only_common_fields.",
                     }
                 )
                 continue
 
-            # Compare if field exists in provided
-            if f == "transaction_count":
+            if field == "transaction_count":
                 try:
                     if int(pv) != int(rv):
-                        mism.append(f)
+                        mism.append(field)
                         value_mismatches.append(
                             {
-                                "month": m,
-                                "field": f,
+                                "month": month,
+                                "field": field,
                                 "provided": int(pv),
                                 "recomputed": int(rv),
                                 "delta": int(rv) - int(pv),
@@ -238,11 +355,11 @@ def compare_monthly_summary(
                             }
                         )
                 except Exception:
-                    mism.append(f)
+                    mism.append(field)
                     value_mismatches.append(
                         {
-                            "month": m,
-                            "field": f,
+                            "month": month,
+                            "field": field,
                             "provided": pv,
                             "recomputed": rv,
                             "delta": None,
@@ -253,80 +370,71 @@ def compare_monthly_summary(
                 if _is_num(pv) and _is_num(rv):
                     delta = float(rv) - float(pv)
                     if abs(delta) > cfg.amount_tolerance:
-                        mism.append(f)
+                        mism.append(field)
                         value_mismatches.append(
                             {
-                                "month": m,
-                                "field": f,
+                                "month": month,
+                                "field": field,
                                 "provided": _round2(pv),
                                 "recomputed": _round2(rv),
                                 "delta": round(delta, 2),
                                 "abs_delta": round(abs(delta), 2),
-                                "meaning": f"{f} differs beyond tolerance (±{cfg.amount_tolerance}).",
+                                "meaning": f"{field} differs beyond tolerance (±{cfg.amount_tolerance}).",
                             }
                         )
-                else:
-                    if str(pv) != str(rv):
-                        mism.append(f)
-                        value_mismatches.append(
-                            {
-                                "month": m,
-                                "field": f,
-                                "provided": pv,
-                                "recomputed": rv,
-                                "delta": None,
-                                "meaning": f"{f} differs (non-numeric).",
-                            }
-                        )
+                elif str(pv) != str(rv):
+                    mism.append(field)
+                    value_mismatches.append(
+                        {
+                            "month": month,
+                            "field": field,
+                            "provided": pv,
+                            "recomputed": rv,
+                            "delta": None,
+                            "meaning": f"{field} differs (non-numeric).",
+                        }
+                    )
 
-        # Month-level summary text (clarity)
         if mism:
             overview.append(
                 {
-                    "month": m,
+                    "month": month,
                     "status": "VALUE_MISMATCH",
                     "summary": f"Real mismatch in: {', '.join(mism)}",
-                    "action": "Investigate month grouping or transaction parsing for this month.",
+                    "action": "Investigate transaction parsing or month grouping for this period.",
                 }
             )
         elif missing and not cfg.compare_only_common_fields:
             overview.append(
                 {
-                    "month": m,
+                    "month": month,
                     "status": "SCHEMA_GAP",
-                    "summary": f"Provided monthly_summary is missing fields: {', '.join(missing)}",
-                    "action": "Add these computed fields to monthly_summary OR turn on compare_only_common_fields.",
+                    "summary": f"Provided summary missing: {', '.join(missing)}",
+                    "action": "Add missing fields upstream or enable compare_only_common_fields.",
                 }
             )
         else:
-            # If compare_only_common_fields=True, missing fields are not treated as an issue
             overview.append(
                 {
-                    "month": m,
-                    "status": "OK" if not mism else "VALUE_MISMATCH",
-                    "summary": "OK (comparable fields match)."
-                    if cfg.compare_only_common_fields
-                    else "OK.",
+                    "month": month,
+                    "status": "OK",
+                    "summary": "OK (all comparable fields match).",
                     "action": "",
                 }
             )
 
-    # If compare_only_common_fields=True, schema gaps should not clutter the UI
     if cfg.compare_only_common_fields:
         missing_fields = []
 
     return value_mismatches, missing_fields, overview
 
 
-# -----------------------------
-# Other checks
-# -----------------------------
 def check_schema(data: Dict[str, Any], cfg: AuditConfig) -> Optional[CheckFinding]:
     required_top = ["summary", "monthly_summary", "transactions"]
-    missing = [k for k in required_top if k not in data]
+    missing = [key for key in required_top if key not in data]
     if missing and cfg.strict_schema:
         return CheckFinding("schema.top_level", "fail", f"Missing top-level keys: {missing}")
-    elif missing:
+    if missing:
         return CheckFinding("schema.top_level", "warn", f"Missing top-level keys (non-strict): {missing}")
 
     tx = data.get("transactions", [])
@@ -339,70 +447,79 @@ def check_summary_consistency(data: Dict[str, Any], recomputed_summary: Dict[str
     provided = data.get("summary", {})
     if not isinstance(provided, dict):
         return CheckFinding("summary.type", "fail", "`summary` must be a dict/object.")
-    pt = provided.get("total_transactions")
-    rt = recomputed_summary.get("total_transactions")
-    if pt is not None and rt is not None:
+
+    provided_total = provided.get("total_transactions")
+    recomputed_total = recomputed_summary.get("total_transactions")
+    if provided_total is not None and recomputed_total is not None:
         try:
-            if int(pt) != int(rt):
-                return CheckFinding("summary.total_transactions", "fail", f"Mismatch: provided={pt} recomputed={rt}")
+            if int(provided_total) != int(recomputed_total):
+                return CheckFinding(
+                    "summary.total_transactions",
+                    "fail",
+                    f"Mismatch: provided={provided_total} recomputed={recomputed_total}",
+                )
         except Exception:
-            return CheckFinding("summary.total_transactions", "warn", f"Could not compare totals: {pt} vs {rt}")
+            return CheckFinding(
+                "summary.total_transactions",
+                "warn",
+                f"Could not compare totals: {provided_total} vs {recomputed_total}",
+            )
     return None
 
 
 def run_audit(data: Dict[str, Any], cfg: AuditConfig) -> AuditResult:
     checks_run = 0
     failed: List[CheckFinding] = []
-    warnings: List[CheckFinding] = []
+    warning_checks: List[CheckFinding] = []
 
     checks_run += 1
-    f = check_schema(data, cfg)
-    if f:
-        (failed if f.status == "fail" else warnings).append(f)
+    schema_finding = check_schema(data, cfg)
+    if schema_finding:
+        (failed if schema_finding.status == "fail" else warning_checks).append(schema_finding)
 
-    tx = data.get("transactions", [])
-    recomputed_summary, recomputed_monthly = recompute_summary_and_monthly(tx if isinstance(tx, list) else [])
+    normalized_tx, tx_notes = _normalize_transactions(data.get("transactions", []))
+    normalized_monthly, monthly_notes = _normalize_monthly_rows(data.get("monthly_summary", []))
+    normalization_notes = tx_notes + monthly_notes
+
+    recomputed_summary, recomputed_monthly = recompute_summary_and_monthly(normalized_tx)
 
     checks_run += 1
-    f = check_summary_consistency(data, recomputed_summary)
-    if f:
-        (failed if f.status == "fail" else warnings).append(f)
+    summary_finding = check_summary_consistency(data, recomputed_summary)
+    if summary_finding:
+        (failed if summary_finding.status == "fail" else warning_checks).append(summary_finding)
 
-    # Monthly compare (clarity-first)
-    val_mism, miss_fields, overview = compare_monthly_summary(data.get("monthly_summary", []), recomputed_monthly, cfg)
+    val_mism, miss_fields, overview = compare_monthly_summary(normalized_monthly, recomputed_monthly, cfg)
 
     if val_mism:
-        warnings.append(
+        failed.append(
             CheckFinding(
                 "monthly_summary.value_mismatch",
                 "fail",
-                f"Monthly numeric mismatches detected: {len(val_mism)} items.",
+                f"Monthly numeric mismatches detected: {len(val_mism)} item(s).",
                 examples=val_mism[: cfg.max_examples],
             )
         )
 
     if miss_fields and not cfg.compare_only_common_fields:
-        warnings.append(
+        warning_checks.append(
             CheckFinding(
                 "monthly_summary.schema_gap",
                 "warn",
-                f"Monthly summary is missing computed fields (schema gap): {len(miss_fields)} items.",
+                f"Monthly summary missing computed fields: {len(miss_fields)} item(s).",
                 examples=miss_fields[: cfg.max_examples],
             )
         )
 
-    # overall = fail only if there are true mismatches or hard failures
-    overall_pass = len([x for x in failed]) == 0 and len(val_mism) == 0
-
     return AuditResult(
-        overall_pass=overall_pass,
+        overall_pass=len(failed) == 0,
         checks_run=checks_run,
-        checks_failed=len(failed) + (1 if val_mism else 0),
-        warnings=len(warnings),
+        checks_failed=len(failed),
+        warnings=len(warning_checks),
         failed_checks=failed,
-        warning_checks=warnings,
+        warning_checks=warning_checks,
         recomputed_summary=recomputed_summary,
         recomputed_monthly_summary=recomputed_monthly,
+        normalization_notes=normalization_notes,
         monthly_value_mismatches=val_mism,
         monthly_missing_fields=miss_fields,
         monthly_overview=overview,
@@ -425,8 +542,9 @@ def audit_report_json(original: Dict[str, Any], result: AuditResult, cfg: AuditC
             "checks_run": result.checks_run,
             "checks_failed": result.checks_failed,
             "warnings": result.warnings,
-            "failed_checks": [f.__dict__ for f in result.failed_checks],
-            "warning_checks": [w.__dict__ for w in result.warning_checks],
+            "normalization_notes": result.normalization_notes,
+            "failed_checks": [finding.__dict__ for finding in result.failed_checks],
+            "warning_checks": [finding.__dict__ for finding in result.warning_checks],
         },
         "monthly_compare": {
             "overview": result.monthly_overview,

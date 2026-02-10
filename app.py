@@ -10,31 +10,48 @@ import streamlit as st
 
 from audit_checks import AuditConfig, audit_report_json, run_audit
 
-st.set_page_config(page_title="Statement Audit", layout="wide")
+st.set_page_config(page_title="Bank Statement Accuracy Checker", layout="wide")
 
-st.markdown("## Statement Audit Console")
-st.caption("Clarity-first audit: separates *real mismatches* from *missing fields (schema gaps)*.")
+st.markdown(
+    """
+    <style>
+    .main .block-container {padding-top: 2rem;}
+    .kpi-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 0.8rem 1rem;
+        background: #ffffff;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Bank Statement Accuracy Checker")
+st.caption(
+    "Second-layer audit to validate JSON statement outputs across multiple bank formats "
+    "while preserving your original checking parameters."
+)
 
 with st.sidebar:
-    st.header("Input")
+    st.header("Data Source")
     input_mode = st.radio(
-        "Choose input mode",
-        ["Fetch by URL (recommended)", "Paste JSON (recommended)"],
+        "Input mode",
+        ["Fetch by URL (recommended)", "Paste JSON"],
         index=0,
         key="input_mode",
     )
     url = st.text_input("JSON URL", placeholder="https://.../full_report.json", key="json_url")
 
     st.divider()
-    st.header("Audit Settings")
+    st.header("Audit Configuration")
     amount_tolerance = st.number_input("Amount tolerance (RM)", min_value=0.0, value=0.01, step=0.01)
     max_examples = st.number_input("Max examples per section", min_value=5, value=30, step=5)
     strict_schema = st.checkbox("Strict schema", value=False)
-
     compare_only_common_fields = st.checkbox(
-        "Compare only common fields (recommended)",
+        "Compare only common fields",
         value=True,
-        help="When ON: if provided monthly_summary doesn't include transaction_count/net_change, we won't treat that as an issue.",
+        help="Ignore missing monthly fields and compare only overlapping fields.",
     )
 
     cfg = AuditConfig(
@@ -44,123 +61,111 @@ with st.sidebar:
         compare_only_common_fields=bool(compare_only_common_fields),
     )
 
+
+def _load_url(raw_url: str) -> Dict[str, Any]:
+    response = requests.get(raw_url, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
 data: Optional[Dict[str, Any]] = None
 source: Optional[str] = None
-
-def _load_url(u: str) -> Dict[str, Any]:
-    r = requests.get(u, timeout=30)
-    r.raise_for_status()
-    return r.json()
 
 try:
     if st.session_state.input_mode.startswith("Fetch"):
         if not url.strip():
-            st.info("Paste a JSON URL in the sidebar.")
+            st.info("Enter a JSON URL in the sidebar to begin.")
             st.stop()
         if st.button("Fetch JSON", type="primary"):
             data = _load_url(url.strip())
-            source = f"url:{url.strip()}"
+            source = f"URL: {url.strip()}"
         else:
             st.stop()
     else:
-        pasted = st.text_area("Paste full JSON", height=260)
+        pasted = st.text_area("Paste full JSON payload", height=260)
         if st.button("Load JSON", type="primary"):
             data = json.loads(pasted)
-            source = "pasted-json"
+            source = "Pasted JSON"
         else:
             st.stop()
-
-except Exception as e:
-    st.error("Failed to load JSON.")
-    st.code(str(e))
+except Exception as err:
+    st.error("Failed to load JSON input.")
+    st.code(str(err))
     st.code(traceback.format_exc())
     st.stop()
 
-st.success(f"Loaded: {source}")
+st.success(f"Loaded source: {source}")
 
-with st.spinner("Running audit..."):
+with st.spinner("Running statement audit..."):
     result = run_audit(data, cfg)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Overall", "PASS ✅" if result.overall_pass else "FAIL ❌")
-c2.metric("Checks run", result.checks_run)
-c3.metric("Failed checks", result.checks_failed)
-c4.metric("Warnings", result.warnings)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Overall Status", "PASS ✅" if result.overall_pass else "FAIL ❌")
+k2.metric("Checks Run", result.checks_run)
+k3.metric("Failed Checks", result.checks_failed)
+k4.metric("Warnings", result.warnings)
+
+if result.normalization_notes:
+    st.info("Compatibility layer applied: " + " | ".join(sorted(set(result.normalization_notes))))
 
 st.divider()
-
-# -----------------------------
-# Monthly clarity section
-# -----------------------------
-st.markdown("## Monthly Summary: Clear Results")
-
-# Explain meaning once
-st.info(
-    "**Important:** If you see “Missing field”, it does **not** mean wrong numbers. "
-    "It means your provided `monthly_summary` simply **doesn’t include** that field, so it cannot be compared."
+st.subheader("Monthly Summary Validation")
+st.caption(
+    "This section separates true numeric mismatches from schema gaps so your team can focus on accuracy issues first."
 )
 
 overview_df = pd.DataFrame(result.monthly_overview or [])
-if not overview_df.empty:
-    st.markdown("### Month Overview (one line per month)")
-    st.dataframe(overview_df, use_container_width=True, height=280)
+if overview_df.empty:
+    st.warning("No monthly overview could be generated.")
 else:
-    st.warning("No monthly overview generated.")
+    st.dataframe(overview_df, use_container_width=True, height=280)
 
-tab1, tab2 = st.tabs(["❌ Real mismatches (action required)", "ℹ️ Missing fields (schema gap)"])
+tab_mismatch, tab_missing = st.tabs(["Real mismatches", "Missing fields (schema gap)"])
 
-with tab1:
-    mism = pd.DataFrame(result.monthly_value_mismatches or [])
-    if mism.empty:
-        st.success("No real numeric mismatches found.")
+with tab_mismatch:
+    mismatch_df = pd.DataFrame(result.monthly_value_mismatches or [])
+    if mismatch_df.empty:
+        st.success("No real numeric mismatches detected.")
     else:
-        st.error("These are **real** differences between provided and recomputed values.")
-        st.dataframe(mism, use_container_width=True, height=360)
+        st.error("These rows indicate real provided-vs-recomputed differences.")
+        st.dataframe(mismatch_df, use_container_width=True, height=340)
 
-with tab2:
-    miss = pd.DataFrame(result.monthly_missing_fields or [])
-    if miss.empty:
-        st.success("No missing-field items (or they are ignored because 'Compare only common fields' is ON).")
+with tab_missing:
+    missing_df = pd.DataFrame(result.monthly_missing_fields or [])
+    if missing_df.empty:
+        st.success("No schema-gap items detected for current settings.")
     else:
-        st.warning(
-            "These are **not errors**. They indicate your provided monthly_summary schema does not include computed fields."
-        )
-        st.dataframe(miss, use_container_width=True, height=360)
+        st.warning("Schema gap means a field is missing in provided monthly_summary, not necessarily wrong values.")
+        st.dataframe(missing_df, use_container_width=True, height=340)
 
 st.divider()
-
-st.markdown("## Monthly: Provided vs Recomputed")
+st.subheader("Provided vs Recomputed Monthly Summary")
 left, right = st.columns(2)
 with left:
-    st.caption("Provided monthly_summary (as-is from JSON)")
-    st.dataframe(pd.DataFrame(data.get("monthly_summary", [])), use_container_width=True, height=260)
-
+    st.caption("Provided monthly_summary")
+    st.dataframe(pd.DataFrame(data.get("monthly_summary", [])), use_container_width=True, height=250)
 with right:
-    st.caption("Recomputed monthly summary (from transactions)")
-    st.dataframe(pd.DataFrame(result.recomputed_monthly_summary or []), use_container_width=True, height=260)
+    st.caption("Recomputed from transactions")
+    st.dataframe(pd.DataFrame(result.recomputed_monthly_summary or []), use_container_width=True, height=250)
 
 st.divider()
-
-st.markdown("## Findings")
+st.subheader("Findings")
 if result.failed_checks:
-    st.subheader("Failed checks")
-    for fc in result.failed_checks:
-        st.error(f"{fc.name}: {fc.message}")
+    for finding in result.failed_checks:
+        st.error(f"{finding.name}: {finding.message}")
 else:
     st.success("No failed checks.")
 
 if result.warning_checks:
-    st.subheader("Warnings")
-    for wc in result.warning_checks:
-        st.warning(f"{wc.name}: {wc.message}")
+    for finding in result.warning_checks:
+        st.warning(f"{finding.name}: {finding.message}")
 
 st.divider()
-
-st.markdown("## Export")
-out = audit_report_json(data, result, cfg)
+st.subheader("Export")
+report = audit_report_json(data, result, cfg)
 st.download_button(
     "Download audit_report.json",
-    data=json.dumps(out, indent=2, ensure_ascii=False).encode("utf-8"),
+    data=json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8"),
     file_name="audit_report.json",
     mime="application/json",
 )
