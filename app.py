@@ -12,11 +12,41 @@ from audit_checks import AuditConfig, audit_report_json, run_audit
 
 st.set_page_config(page_title="Statement Audit", layout="wide")
 
-st.markdown("## Statement Audit Console")
-st.caption("Clarity-first audit: separates *real mismatches* from *missing fields (schema gaps)*.")
+st.markdown(
+    """
+    <style>
+    .hero-card {
+        padding: 1rem 1.25rem;
+        border-radius: 12px;
+        background: linear-gradient(135deg, rgba(35, 101, 189, 0.12), rgba(37, 184, 172, 0.10));
+        border: 1px solid rgba(120,120,120,.2);
+        margin-bottom: .75rem;
+    }
+    .hero-title {
+        font-weight: 700;
+        font-size: 1.4rem;
+        margin-bottom: .2rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="hero-card">
+        <div class="hero-title">Bank Statement Accuracy Console</div>
+        <div>
+            Clarity-first verification for extracted JSON. The checker highlights <b>real calculation mismatches</b>
+            separately from <b>schema gaps</b> so investigation is faster and cleaner.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
-    st.header("Input")
+    st.header("Input Source")
     input_mode = st.radio(
         "Choose input mode",
         ["Fetch by URL (recommended)", "Paste JSON (recommended)"],
@@ -35,6 +65,11 @@ with st.sidebar:
         "Compare only common fields (recommended)",
         value=True,
         help="When ON: if provided monthly_summary doesn't include transaction_count/net_change, we won't treat that as an issue.",
+    )
+
+    st.caption(
+        "Supports common alternate bank fields, including transaction_date/posting_date, "
+        "deposit/withdrawal, and amount+type formats."
     )
 
     cfg = AuditConfig(
@@ -76,7 +111,7 @@ except Exception as e:
     st.code(traceback.format_exc())
     st.stop()
 
-st.success(f"Loaded: {source}")
+st.success(f"Loaded source: {source}")
 
 with st.spinner("Running audit..."):
     result = run_audit(data, cfg)
@@ -92,7 +127,7 @@ st.divider()
 # -----------------------------
 # Monthly clarity section
 # -----------------------------
-st.markdown("## Monthly Summary: Clear Results")
+st.markdown("## Monthly Summary Analysis")
 
 # Explain meaning once
 st.info(
@@ -141,7 +176,7 @@ with right:
 
 st.divider()
 
-st.markdown("## Findings")
+st.markdown("## Validation Findings")
 if result.failed_checks:
     st.subheader("Failed checks")
     for fc in result.failed_checks:
@@ -156,7 +191,7 @@ if result.warning_checks:
 
 st.divider()
 
-st.markdown("## Export")
+st.markdown("## Export Audit Result")
 out = audit_report_json(data, result, cfg)
 st.download_button(
     "Download audit_report.json",

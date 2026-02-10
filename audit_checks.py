@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,6 +72,11 @@ def _float_or_nan(x: Any) -> float:
     try:
         if x is None or (isinstance(x, str) and x.strip() == ""):
             return float("nan")
+        if isinstance(x, str):
+            cleaned = re.sub(r"[^0-9.\-]", "", x)
+            if cleaned in {"", "-", ".", "-."}:
+                return float("nan")
+            return float(cleaned)
         return float(x)
     except Exception:
         return float("nan")
@@ -99,16 +105,87 @@ def _index_by_month(rows: Any) -> Dict[str, Dict[str, Any]]:
         return {}
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        if isinstance(r, dict) and r.get("month"):
-            out[str(r["month"])] = r
+        if isinstance(r, dict):
+            month = _extract_month_value(r)
+            if month:
+                out[month] = r
     return out
+
+
+def _extract_first(d: Dict[str, Any], keys: List[str]) -> Any:
+    for key in keys:
+        if key in d and d.get(key) not in (None, ""):
+            return d.get(key)
+    return None
+
+
+def _extract_month_value(row: Dict[str, Any]) -> Optional[str]:
+    raw_month = _extract_first(row, ["month", "period", "month_year", "year_month", "statement_month"])
+    if raw_month is None:
+        return None
+    dt = _parse_date_safe(raw_month)
+    if dt:
+        return _month_key(dt)
+
+    text = str(raw_month).strip()
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return text
+    if re.fullmatch(r"\d{2}/\d{4}", text):
+        mm, yyyy = text.split("/")
+        return f"{yyyy}-{mm}"
+    return text
+
+
+def _normalize_transaction(tx: Dict[str, Any]) -> Dict[str, Any]:
+    date_value = _extract_first(tx, ["date", "transaction_date", "posting_date", "value_date", "txn_date"])
+    debit_value = _extract_first(tx, ["debit", "withdrawal", "money_out", "debit_amount"])
+    credit_value = _extract_first(tx, ["credit", "deposit", "money_in", "credit_amount"])
+
+    amount_value = _extract_first(tx, ["amount", "transaction_amount", "amt"])
+    tx_type = str(_extract_first(tx, ["type", "transaction_type", "dr_cr", "direction"]) or "").strip().lower()
+
+    debit = _float_or_nan(debit_value)
+    credit = _float_or_nan(credit_value)
+
+    if not _is_num(debit) and not _is_num(credit) and amount_value is not None:
+        amt = _float_or_nan(amount_value)
+        if _is_num(amt):
+            if tx_type in {"debit", "dr", "withdrawal", "out", "expense"}:
+                debit = abs(amt)
+                credit = 0.0
+            elif tx_type in {"credit", "cr", "deposit", "in", "income"}:
+                debit = 0.0
+                credit = abs(amt)
+            elif amt < 0:
+                debit = abs(amt)
+                credit = 0.0
+            else:
+                debit = 0.0
+                credit = abs(amt)
+
+    return {
+        "date": date_value,
+        "debit": None if not _is_num(debit) else debit,
+        "credit": None if not _is_num(credit) else credit,
+    }
+
+
+def _extract_monthly_field(row: Dict[str, Any], field_name: str) -> Any:
+    aliases = {
+        "transaction_count": ["transaction_count", "count", "total_transactions", "transactions"],
+        "total_debit": ["total_debit", "debit", "debit_total", "withdrawal_total", "outflow"],
+        "total_credit": ["total_credit", "credit", "credit_total", "deposit_total", "inflow"],
+        "net_change": ["net_change", "net", "net_amount", "balance_change"],
+    }
+    return _extract_first(row, aliases.get(field_name, [field_name]))
 
 
 # -----------------------------
 # Recompute monthly from transactions
 # -----------------------------
 def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    df = pd.DataFrame(transactions)
+    normalized_tx = [_normalize_transaction(tx) for tx in transactions if isinstance(tx, dict)]
+    df = pd.DataFrame(normalized_tx)
     if df.empty:
         return ({"total_transactions": 0, "date_range": {"start": None, "end": None}}, [])
 
@@ -206,7 +283,7 @@ def compare_monthly_summary(
         mism = []
 
         for f in computed_fields:
-            pv = pr.get(f, None)
+            pv = _extract_monthly_field(pr, f)
             rv = rr.get(f, None)
 
             if pv is None:
