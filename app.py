@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -10,15 +11,16 @@ import streamlit as st
 from audit_checks import AuditConfig, audit_report_json, run_audit
 
 st.set_page_config(page_title="Bank Report Audit", layout="wide")
+
 st.title("Bank Statement Output Audit")
 st.caption(
-    "Upload `full_report.json` (from your bank statement app) or fetch it by URL. "
-    "This tool validates internal consistency: monthly totals, balances continuity, duplicates, and schema."
+    "If upload triggers 'Reconnecting…', it usually means the server crashed/restarted. "
+    "This build is hardened to prevent upload crashes and to surface errors."
 )
 
-# =========================================================
-# SIDEBAR (IMPORTANT): uploader is ALWAYS rendered here
-# =========================================================
+# -----------------------------
+# Sidebar (uploader ALWAYS rendered)
+# -----------------------------
 with st.sidebar:
     st.header("Input")
 
@@ -29,12 +31,10 @@ with st.sidebar:
         key="input_mode",
     )
 
-    # Always render uploader (never behind st.stop)
     uploaded = st.file_uploader(
         "Upload full_report.json",
         type=["json"],
         key="json_uploader",
-        help="If upload does nothing, check Railway HTTP logs. You should see a POST request when this works.",
     )
 
     url = st.text_input(
@@ -55,59 +55,93 @@ with st.sidebar:
         strict_schema=bool(strict_schema),
     )
 
-    st.divider()
-    st.header("Export")
-    st.caption("You can download an audit report JSON after running checks.")
+# -----------------------------
+# Debug panel
+# -----------------------------
+with st.expander("Debug / Diagnostics", expanded=True):
+    st.write("If upload causes reconnect, check Railway **Deploy Logs** for a traceback.")
+    st.write("This panel shows what the server actually received (if it received anything).")
 
-# =========================================================
-# LOAD INPUT (no st.stop before uploader)
-# =========================================================
+
+def load_json_from_upload(up) -> Dict[str, Any]:
+    """
+    Robust loader:
+    - Reads bytes once
+    - Tries UTF-8
+    - If that fails, tries JSON from bytes via latin-1
+    - If still fails, raises with clear context
+    """
+    raw = up.getvalue()  # safe: does not consume stream multiple times
+    if raw is None:
+        raise ValueError("No bytes received from uploader.")
+
+    # size sanity (helps confirm upload actually arrived)
+    st.write(f"✅ Upload bytes received: {len(raw)} bytes")
+
+    # Try parsing directly from bytes decoding
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        return json.loads(raw.decode("latin-1"))
+    except json.JSONDecodeError as e:
+        # show first 200 chars for debugging (safe)
+        preview = raw[:200]
+        try:
+            preview_text = preview.decode("utf-8", errors="replace")
+        except Exception:
+            preview_text = str(preview)
+        raise ValueError(f"JSON decode error: {e}. First bytes preview: {preview_text!r}")
+
+
+def load_json_from_url(u: str) -> Dict[str, Any]:
+    r = requests.get(u, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
 data: Optional[Dict[str, Any]] = None
 source: Optional[str] = None
-load_error: Optional[str] = None
 
-if st.session_state.input_mode == "Upload JSON":
-    if uploaded is not None:
-        try:
-            # confirm immediately so you know it really uploaded
-            st.sidebar.success(f"Received: {uploaded.name} ({uploaded.size} bytes)")
-            raw = uploaded.read()
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                data = json.loads(raw.decode("latin-1"))
+try:
+    if st.session_state.input_mode == "Upload JSON":
+        if uploaded is not None:
+            # confirm immediately
+            st.sidebar.success(f"Selected: {uploaded.name} ({uploaded.size} bytes)")
+            data = load_json_from_upload(uploaded)
             source = f"upload:{uploaded.name}"
-        except Exception as e:
-            load_error = f"Failed to parse uploaded JSON: {e}"
-else:
-    u = (st.session_state.json_url or "").strip()
-    if u:
-        try:
-            r = requests.get(u, timeout=30)
-            r.raise_for_status()
-            data = r.json()
+    else:
+        u = (st.session_state.json_url or "").strip()
+        if u:
+            data = load_json_from_url(u)
             source = f"url:{u}"
             st.sidebar.success("Fetched JSON from URL.")
-        except Exception as e:
-            load_error = f"Failed to fetch/parse JSON from URL: {e}"
-
-if load_error:
-    st.error(load_error)
+except Exception as e:
+    st.error("❌ Failed to load JSON. Details below.")
+    st.code(str(e))
+    st.code(traceback.format_exc())
     st.stop()
 
 if data is None:
-    st.info("Use the sidebar: Upload a JSON or choose Fetch by URL.")
+    st.info("Use the sidebar to upload a JSON or fetch by URL.")
     st.stop()
 
 st.success(f"Loaded report from: {source}")
 
-# =========================================================
-# RUN AUDIT
-# =========================================================
-with st.spinner("Running audit checks..."):
-    result = run_audit(data, cfg)
+# -----------------------------
+# Run audit (guarded)
+# -----------------------------
+try:
+    with st.spinner("Running audit checks..."):
+        result = run_audit(data, cfg)
+except Exception as e:
+    st.error("❌ Audit crashed (this should not happen).")
+    st.code(str(e))
+    st.code(traceback.format_exc())
+    st.stop()
 
-# Summary metrics
+# -----------------------------
+# UI output
+# -----------------------------
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Overall", "PASS ✅" if result.overall_pass else "FAIL ❌")
 c2.metric("Checks run", str(result.checks_run))
@@ -116,7 +150,6 @@ c4.metric("Warnings", str(result.warnings))
 
 st.divider()
 
-# Failed checks
 if result.failed_checks:
     st.subheader("Failed checks")
     for fc in result.failed_checks:
@@ -127,7 +160,6 @@ if result.failed_checks:
 else:
     st.success("No failed checks detected.")
 
-# Warnings
 if result.warning_checks:
     st.subheader("Warnings")
     for wc in result.warning_checks:
@@ -138,7 +170,6 @@ if result.warning_checks:
 
 st.divider()
 
-# Monthly summary comparison
 st.subheader("Monthly summary comparison")
 left, right = st.columns(2)
 
@@ -147,17 +178,11 @@ recomputed_monthly = result.recomputed_monthly_summary or []
 
 with left:
     st.caption("Provided `monthly_summary`")
-    if isinstance(provided_monthly, list) and provided_monthly:
-        st.dataframe(pd.DataFrame(provided_monthly))
-    else:
-        st.info("No `monthly_summary` present in input.")
+    st.dataframe(pd.DataFrame(provided_monthly) if isinstance(provided_monthly, list) else pd.DataFrame())
 
 with right:
     st.caption("Recomputed monthly summary (from transactions)")
-    if recomputed_monthly:
-        st.dataframe(pd.DataFrame(recomputed_monthly))
-    else:
-        st.info("Could not recompute monthly summary (missing/invalid transactions).")
+    st.dataframe(pd.DataFrame(recomputed_monthly) if recomputed_monthly else pd.DataFrame())
 
 if result.monthly_diffs:
     st.subheader("Monthly diffs (provided vs recomputed)")
@@ -165,7 +190,6 @@ if result.monthly_diffs:
 
 st.divider()
 
-# Transactions preview
 st.subheader("Transactions preview")
 tx = data.get("transactions", [])
 if isinstance(tx, list) and tx:
@@ -176,7 +200,6 @@ else:
 
 st.divider()
 
-# Download audit report
 out = audit_report_json(data, result, cfg)
 st.download_button(
     "Download audit_report.json",
