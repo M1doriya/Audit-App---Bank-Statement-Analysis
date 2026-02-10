@@ -8,9 +8,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 
-# -----------------------------
-# Config + Result Structures
-# -----------------------------
 @dataclass
 class AuditConfig:
     amount_tolerance: float = 0.01
@@ -34,15 +31,11 @@ class AuditResult:
     warnings: int
     failed_checks: List[CheckFinding] = field(default_factory=list)
     warning_checks: List[CheckFinding] = field(default_factory=list)
-
     recomputed_summary: Optional[Dict[str, Any]] = None
     recomputed_monthly_summary: Optional[List[Dict[str, Any]]] = None
     monthly_diffs: Optional[List[Dict[str, Any]]] = None
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _isclose(a: Any, b: Any, tol: float) -> bool:
     try:
         fa = float(a)
@@ -61,18 +54,15 @@ def _parse_date_safe(x: Any) -> Optional[datetime]:
     if not s:
         return None
 
-    # Common formats in bank outputs
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y"):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
             pass
 
-    # Last resort: pandas parser (more flexible, but be careful)
     try:
         dt = pd.to_datetime(s, errors="coerce", dayfirst=False)
         if pd.isna(dt):
-            # try dayfirst
             dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if pd.isna(dt):
             return None
@@ -98,26 +88,20 @@ def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 
-# -----------------------------
-# Core recomputation
-# -----------------------------
 def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     df = pd.DataFrame(transactions)
-
     if df.empty:
         return (
             {"total_transactions": 0, "date_range": {"start": None, "end": None}},
             [],
         )
 
-    # Normalize types
-    df["__date"] = df["date"].apply(_parse_date_safe)
-    df["__debit"] = df["debit"].apply(_float_or_nan)
-    df["__credit"] = df["credit"].apply(_float_or_nan)
-    df["__balance"] = df["balance"].apply(_float_or_nan)
+    df["__date"] = df["date"].apply(_parse_date_safe) if "date" in df.columns else None
+    df["__debit"] = df["debit"].apply(_float_or_nan) if "debit" in df.columns else float("nan")
+    df["__credit"] = df["credit"].apply(_float_or_nan) if "credit" in df.columns else float("nan")
+    df["__balance"] = df["balance"].apply(_float_or_nan) if "balance" in df.columns else float("nan")
     df["__source_file"] = df.get("source_file", pd.Series([""] * len(df))).apply(_safe_str)
 
-    # Date range
     valid_dates = df["__date"].dropna()
     start = valid_dates.min() if not valid_dates.empty else None
     end = valid_dates.max() if not valid_dates.empty else None
@@ -130,33 +114,29 @@ def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[D
         },
     }
 
-    # Monthly summary
     df_valid = df.dropna(subset=["__date"]).copy()
     if df_valid.empty:
         return summary, []
 
     df_valid["__month"] = df_valid["__date"].apply(_month_key)
 
-    # Sort for ending balance: by date then page then original index
-    if "page" in df_valid.columns:
-        df_valid["__page"] = df_valid["page"].apply(_float_or_nan)
-    else:
-        df_valid["__page"] = float("nan")
+    df_valid["__page"] = df_valid["page"].apply(_float_or_nan) if "page" in df_valid.columns else float("nan")
     df_valid["__idx"] = range(len(df_valid))
     df_valid = df_valid.sort_values(["__month", "__date", "__page", "__idx"], ascending=True)
 
-    monthly_rows: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     for m, g in df_valid.groupby("__month", sort=True):
         debit_sum = float(pd.Series(g["__debit"]).fillna(0).sum())
         credit_sum = float(pd.Series(g["__credit"]).fillna(0).sum())
-        bal_series = pd.Series(g["__balance"]).dropna()
 
+        bal_series = pd.Series(g["__balance"]).dropna()
         ending_balance = float(bal_series.iloc[-1]) if not bal_series.empty else float("nan")
         lowest = float(bal_series.min()) if not bal_series.empty else float("nan")
         highest = float(bal_series.max()) if not bal_series.empty else float("nan")
 
         files = sorted({f for f in g["__source_file"].tolist() if f})
-        monthly_rows.append(
+
+        rows.append(
             {
                 "month": m,
                 "transaction_count": int(len(g)),
@@ -170,139 +150,74 @@ def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[D
             }
         )
 
-    return summary, monthly_rows
+    return summary, rows
 
 
-# -----------------------------
-# Checks
-# -----------------------------
 def check_schema(data: Dict[str, Any], cfg: AuditConfig) -> Optional[CheckFinding]:
     required_top = ["summary", "monthly_summary", "transactions"]
     missing = [k for k in required_top if k not in data]
+
     if missing and cfg.strict_schema:
-        return CheckFinding(
-            name="schema.top_level",
-            status="fail",
-            message=f"Missing top-level keys: {missing}",
-        )
+        return CheckFinding("schema.top_level", "fail", f"Missing top-level keys: {missing}")
     elif missing:
-        return CheckFinding(
-            name="schema.top_level",
-            status="warn",
-            message=f"Missing top-level keys (non-strict mode): {missing}",
-        )
+        return CheckFinding("schema.top_level", "warn", f"Missing top-level keys (non-strict): {missing}")
 
     tx = data.get("transactions", [])
     if not isinstance(tx, list):
-        return CheckFinding(
-            name="schema.transactions_type",
-            status="fail",
-            message="`transactions` must be a list.",
-        )
+        return CheckFinding("schema.transactions_type", "fail", "`transactions` must be a list.")
 
-    # If there are transactions, validate expected fields exist
-    expected_fields = ["date", "description", "debit", "credit", "balance", "page", "bank", "source_file"]
-    if tx:
-        row0 = tx[0]
-        if isinstance(row0, dict):
-            miss = [f for f in expected_fields if f not in row0]
-            if miss and cfg.strict_schema:
-                return CheckFinding(
-                    name="schema.transaction_fields",
-                    status="fail",
-                    message=f"Missing required transaction fields: {miss}",
-                )
-            elif miss:
-                return CheckFinding(
-                    name="schema.transaction_fields",
-                    status="warn",
-                    message=f"Missing transaction fields (non-strict mode): {miss}",
-                )
-        else:
-            return CheckFinding(
-                name="schema.transactions_rows",
-                status="fail",
-                message="Each transaction must be an object/dict.",
-            )
+    if tx and not isinstance(tx[0], dict):
+        return CheckFinding("schema.transactions_rows", "fail", "Each transaction must be an object/dict.")
+
+    if tx and isinstance(tx[0], dict):
+        expected = ["date", "description", "debit", "credit", "balance", "page", "bank", "source_file"]
+        miss = [f for f in expected if f not in tx[0]]
+        if miss and cfg.strict_schema:
+            return CheckFinding("schema.transaction_fields", "fail", f"Missing transaction fields: {miss}")
+        elif miss:
+            return CheckFinding("schema.transaction_fields", "warn", f"Missing transaction fields (non-strict): {miss}")
 
     return None
 
 
-def check_summary_consistency(data: Dict[str, Any], recomputed_summary: Dict[str, Any], cfg: AuditConfig) -> Optional[CheckFinding]:
+def check_summary_consistency(data: Dict[str, Any], recomputed_summary: Dict[str, Any]) -> Optional[CheckFinding]:
     provided = data.get("summary", {})
     if not isinstance(provided, dict):
-        return CheckFinding(
-            name="summary.type",
-            status="fail",
-            message="`summary` must be a dict/object.",
-        )
+        return CheckFinding("summary.type", "fail", "`summary` must be a dict/object.")
 
-    # total_transactions
     pt = provided.get("total_transactions")
     rt = recomputed_summary.get("total_transactions")
     if pt is not None and rt is not None and int(pt) != int(rt):
         return CheckFinding(
-            name="summary.total_transactions",
-            status="fail",
-            message=f"`summary.total_transactions` mismatch: provided={pt} recomputed={rt}",
+            "summary.total_transactions",
+            "fail",
+            f"`summary.total_transactions` mismatch: provided={pt} recomputed={rt}",
         )
-
-    # date_range
-    pdr = provided.get("date_range", {})
-    rdr = recomputed_summary.get("date_range", {})
-    if isinstance(pdr, dict) and isinstance(rdr, dict):
-        ps, pe = pdr.get("start"), pdr.get("end")
-        rs, re = rdr.get("start"), rdr.get("end")
-        # Only fail if provided is set and differs
-        if ps and rs and str(ps) != str(rs):
-            return CheckFinding(
-                name="summary.date_range.start",
-                status="warn",
-                message=f"`summary.date_range.start` differs: provided={ps} recomputed={rs}",
-            )
-        if pe and re and str(pe) != str(re):
-            return CheckFinding(
-                name="summary.date_range.end",
-                status="warn",
-                message=f"`summary.date_range.end` differs: provided={pe} recomputed={re}",
-            )
-
     return None
 
 
-def check_monthly_summary(data: Dict[str, Any], recomputed_monthly: List[Dict[str, Any]], cfg: AuditConfig) -> Tuple[Optional[CheckFinding], List[Dict[str, Any]]]:
+def check_monthly_summary(
+    data: Dict[str, Any],
+    recomputed_monthly: List[Dict[str, Any]],
+    cfg: AuditConfig,
+) -> Tuple[Optional[CheckFinding], List[Dict[str, Any]]]:
     provided = data.get("monthly_summary", [])
     if not provided:
         return (
-            CheckFinding(
-                name="monthly_summary.missing",
-                status="warn",
-                message="No `monthly_summary` provided; recomputation available but no comparison possible.",
-            ),
+            CheckFinding("monthly_summary.missing", "warn", "No `monthly_summary` provided; cannot compare."),
             [],
         )
 
     if not isinstance(provided, list):
-        return (
-            CheckFinding(
-                name="monthly_summary.type",
-                status="fail",
-                message="`monthly_summary` must be a list.",
-            ),
-            [],
-        )
+        return (CheckFinding("monthly_summary.type", "fail", "`monthly_summary` must be a list."), [])
 
     p_df = pd.DataFrame(provided)
     r_df = pd.DataFrame(recomputed_monthly)
 
-    if p_df.empty and r_df.empty:
-        return (None, [])
-
-    # Align by month
     diffs: List[Dict[str, Any]] = []
     all_months = sorted(set(p_df.get("month", pd.Series([], dtype=str)).tolist()) | set(r_df.get("month", pd.Series([], dtype=str)).tolist()))
 
-    fields_to_compare = ["transaction_count", "total_debit", "total_credit", "net_change", "ending_balance", "lowest_balance", "highest_balance"]
+    fields = ["transaction_count", "total_debit", "total_credit", "net_change", "ending_balance", "lowest_balance", "highest_balance"]
 
     def row_by_month(df: pd.DataFrame, m: str) -> Dict[str, Any]:
         if df.empty or "month" not in df.columns:
@@ -319,7 +234,7 @@ def check_monthly_summary(data: Dict[str, Any], recomputed_monthly: List[Dict[st
             diffs.append({"month": m, "issue": "month_missing", "provided_exists": bool(pr), "recomputed_exists": bool(rr)})
             continue
 
-        for f in fields_to_compare:
+        for f in fields:
             pv = pr.get(f)
             rv = rr.get(f)
             if f == "transaction_count":
@@ -329,7 +244,6 @@ def check_monthly_summary(data: Dict[str, Any], recomputed_monthly: List[Dict[st
                 except Exception:
                     diffs.append({"month": m, "field": f, "provided": pv, "recomputed": rv})
             else:
-                # compare floats with tolerance
                 if pv is None and rv is None:
                     continue
                 if pv is None or rv is None:
@@ -340,14 +254,13 @@ def check_monthly_summary(data: Dict[str, Any], recomputed_monthly: List[Dict[st
     if diffs:
         return (
             CheckFinding(
-                name="monthly_summary.diff",
-                status="fail",
-                message=f"Monthly summary differs from recomputation in {len(diffs)} places (see diffs).",
-                examples=diffs[: int(cfg.max_examples)],
+                "monthly_summary.diff",
+                "fail",
+                f"Monthly summary differs from recomputation in {len(diffs)} places (showing up to {cfg.max_examples}).",
+                diffs[: int(cfg.max_examples)],
             ),
             diffs,
         )
-
     return (None, diffs)
 
 
@@ -360,9 +273,9 @@ def check_balance_continuity(data: Dict[str, Any], cfg: AuditConfig) -> Optional
     needed = {"debit", "credit", "balance", "source_file"}
     if not needed.issubset(set(df.columns)):
         return CheckFinding(
-            name="balance_continuity.skipped",
-            status="warn",
-            message=f"Skipping balance continuity check (missing fields: {sorted(list(needed - set(df.columns)))})",
+            "balance_continuity.skipped",
+            "warn",
+            f"Skipping balance continuity (missing: {sorted(list(needed - set(df.columns)))})",
         )
 
     df["__date"] = df["date"].apply(_parse_date_safe) if "date" in df.columns else None
@@ -373,7 +286,6 @@ def check_balance_continuity(data: Dict[str, Any], cfg: AuditConfig) -> Optional
     df["__source_file"] = df["source_file"].apply(_safe_str)
     df["__bank"] = df["bank"].apply(_safe_str) if "bank" in df.columns else ""
 
-    # Sort by source file, then date, then page, then original index
     df["__idx"] = range(len(df))
     df = df.sort_values(["__source_file", "__date", "__page", "__idx"], ascending=True)
 
@@ -385,7 +297,6 @@ def check_balance_continuity(data: Dict[str, Any], cfg: AuditConfig) -> Optional
         prev_row = None
         for i in range(len(g)):
             bal = g.loc[i, "__balance"]
-            # If balance missing, skip continuity
             if not math.isfinite(bal):
                 prev_bal = None
                 prev_row = None
@@ -421,10 +332,10 @@ def check_balance_continuity(data: Dict[str, Any], cfg: AuditConfig) -> Optional
 
     if mismatches:
         return CheckFinding(
-            name="balance_continuity.mismatch",
-            status="fail",
-            message=f"Balance continuity mismatches found (showing up to {cfg.max_examples}). This often indicates parsing errors or missing rows.",
-            examples=mismatches,
+            "balance_continuity.mismatch",
+            "fail",
+            f"Balance continuity mismatches found (showing up to {cfg.max_examples}).",
+            mismatches,
         )
     return None
 
@@ -437,112 +348,84 @@ def check_duplicates_and_suspicious(data: Dict[str, Any], cfg: AuditConfig) -> L
 
     df = pd.DataFrame(tx)
 
-    # Duplicate transactions (exact match on core fields)
     core = [c for c in ["date", "description", "debit", "credit", "balance", "source_file"] if c in df.columns]
     if core:
         dup = df[df.duplicated(subset=core, keep=False)]
         if not dup.empty:
-            examples = dup[core].head(int(cfg.max_examples)).to_dict(orient="records")
             findings.append(
                 CheckFinding(
-                    name="transactions.duplicates",
-                    status="warn",
-                    message=f"Found {len(dup)} duplicated rows by core fields (may be legitimate, but often indicates double-extraction).",
-                    examples=examples,
+                    "transactions.duplicates",
+                    "warn",
+                    f"Found {len(dup)} duplicated rows by core fields (showing up to {cfg.max_examples}).",
+                    dup[core].head(int(cfg.max_examples)).to_dict(orient="records"),
                 )
             )
 
-    # Suspicious: both debit and credit non-zero
     if "debit" in df.columns and "credit" in df.columns:
         df["__debit"] = df["debit"].apply(_float_or_nan).fillna(0.0)
         df["__credit"] = df["credit"].apply(_float_or_nan).fillna(0.0)
+
         both = df[(df["__debit"] > 0) & (df["__credit"] > 0)]
         if not both.empty:
-            examples = both[["date", "description", "debit", "credit", "balance", "source_file"]].head(int(cfg.max_examples)).to_dict(orient="records")
+            cols = [c for c in ["date", "description", "debit", "credit", "balance", "source_file"] if c in df.columns]
             findings.append(
                 CheckFinding(
-                    name="transactions.debit_and_credit",
-                    status="warn",
-                    message=f"{len(both)} rows have both debit and credit > 0 (often a sign of column shift/misalignment).",
-                    examples=examples,
+                    "transactions.debit_and_credit",
+                    "warn",
+                    f"{len(both)} rows have both debit and credit > 0 (showing up to {cfg.max_examples}).",
+                    both[cols].head(int(cfg.max_examples)).to_dict(orient="records"),
                 )
             )
 
         neg = df[(df["__debit"] < 0) | (df["__credit"] < 0)]
         if not neg.empty:
-            examples = neg[["date", "description", "debit", "credit", "balance", "source_file"]].head(int(cfg.max_examples)).to_dict(orient="records")
+            cols = [c for c in ["date", "description", "debit", "credit", "balance", "source_file"] if c in df.columns]
             findings.append(
                 CheckFinding(
-                    name="transactions.negative_amounts",
-                    status="warn",
-                    message=f"{len(neg)} rows have negative debit/credit values (usually parsing/sign issue).",
-                    examples=examples,
+                    "transactions.negative_amounts",
+                    "warn",
+                    f"{len(neg)} rows have negative debit/credit values (showing up to {cfg.max_examples}).",
+                    neg[cols].head(int(cfg.max_examples)).to_dict(orient="records"),
                 )
             )
 
     return findings
 
 
-# -----------------------------
-# Orchestration
-# -----------------------------
 def run_audit(data: Dict[str, Any], cfg: AuditConfig) -> AuditResult:
     checks_run = 0
     failed: List[CheckFinding] = []
     warnings: List[CheckFinding] = []
 
-    # 1) Schema
     checks_run += 1
     f = check_schema(data, cfg)
     if f:
-        if f.status == "fail":
-            failed.append(f)
-        else:
-            warnings.append(f)
+        (failed if f.status == "fail" else warnings).append(f)
 
-    # 2) Recompute summary/monthly
     tx = data.get("transactions", [])
     recomputed_summary, recomputed_monthly = recompute_summary_and_monthly(tx if isinstance(tx, list) else [])
 
-    # 3) Summary consistency
     checks_run += 1
-    f = check_summary_consistency(data, recomputed_summary, cfg)
+    f = check_summary_consistency(data, recomputed_summary)
     if f:
-        if f.status == "fail":
-            failed.append(f)
-        else:
-            warnings.append(f)
+        (failed if f.status == "fail" else warnings).append(f)
 
-    # 4) Monthly summary compare
     checks_run += 1
     f, diffs = check_monthly_summary(data, recomputed_monthly, cfg)
     if f:
-        if f.status == "fail":
-            failed.append(f)
-        else:
-            warnings.append(f)
+        (failed if f.status == "fail" else warnings).append(f)
 
-    # 5) Balance continuity
     checks_run += 1
     f = check_balance_continuity(data, cfg)
     if f:
-        if f.status == "fail":
-            failed.append(f)
-        else:
-            warnings.append(f)
+        (failed if f.status == "fail" else warnings).append(f)
 
-    # 6) Duplicates / suspicious
     checks_run += 1
     for f2 in check_duplicates_and_suspicious(data, cfg):
-        if f2.status == "fail":
-            failed.append(f2)
-        else:
-            warnings.append(f2)
-
-    overall_pass = len(failed) == 0
+        (failed if f2.status == "fail" else warnings).append(f2)
 
     return AuditResult(
-        overall_pass=overall_pass,
+        overall_pass=(len(failed) == 0),
         checks_run=checks_run,
         checks_failed=len(failed),
         warnings=len(warnings),
