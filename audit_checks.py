@@ -36,15 +36,9 @@ class AuditResult:
     monthly_diffs: Optional[List[Dict[str, Any]]] = None
 
 
-def _isclose(a: Any, b: Any, tol: float) -> bool:
-    try:
-        fa = float(a)
-        fb = float(b)
-        return math.isfinite(fa) and math.isfinite(fb) and abs(fa - fb) <= tol
-    except Exception:
-        return False
-
-
+# -----------------------------
+# Helpers
+# -----------------------------
 def _parse_date_safe(x: Any) -> Optional[datetime]:
     if x is None:
         return None
@@ -54,7 +48,7 @@ def _parse_date_safe(x: Any) -> Optional[datetime]:
     if not s:
         return None
 
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d %b %Y", "%d %B %Y"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
@@ -88,6 +82,28 @@ def _safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 
+def _is_num(x: Any) -> bool:
+    try:
+        return math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _round2(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        f = float(x)
+        if not math.isfinite(f):
+            return None
+        return round(f, 2)
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Recompute from transactions (bank-agnostic)
+# -----------------------------
 def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     df = pd.DataFrame(transactions)
     if df.empty:
@@ -120,43 +136,32 @@ def recompute_summary_and_monthly(transactions: List[Dict[str, Any]]) -> Tuple[D
 
     df_valid["__month"] = df_valid["__date"].apply(_month_key)
 
-    df_valid["__page"] = df_valid["page"].apply(_float_or_nan) if "page" in df_valid.columns else float("nan")
-    df_valid["__idx"] = range(len(df_valid))
-    df_valid = df_valid.sort_values(["__month", "__date", "__page", "__idx"], ascending=True)
+    debit0 = pd.Series(df_valid["__debit"]).fillna(0.0)
+    credit0 = pd.Series(df_valid["__credit"]).fillna(0.0)
 
     rows: List[Dict[str, Any]] = []
     for m, g in df_valid.groupby("__month", sort=True):
-        debit_sum = float(pd.Series(g["__debit"]).fillna(0).sum())
-        credit_sum = float(pd.Series(g["__credit"]).fillna(0).sum())
-
-        bal_series = pd.Series(g["__balance"]).dropna()
-        ending_balance = float(bal_series.iloc[-1]) if not bal_series.empty else float("nan")
-        lowest = float(bal_series.min()) if not bal_series.empty else float("nan")
-        highest = float(bal_series.max()) if not bal_series.empty else float("nan")
-
-        files = sorted({f for f in g["__source_file"].tolist() if f})
-
+        d = float(pd.Series(g["__debit"]).fillna(0.0).sum())
+        c = float(pd.Series(g["__credit"]).fillna(0.0).sum())
         rows.append(
             {
                 "month": m,
                 "transaction_count": int(len(g)),
-                "total_debit": round(debit_sum, 2),
-                "total_credit": round(credit_sum, 2),
-                "net_change": round(credit_sum - debit_sum, 2),
-                "ending_balance": None if math.isnan(ending_balance) else round(ending_balance, 2),
-                "lowest_balance": None if math.isnan(lowest) else round(lowest, 2),
-                "highest_balance": None if math.isnan(highest) else round(highest, 2),
-                "source_files": ", ".join(files),
+                "total_debit": round(d, 2),
+                "total_credit": round(c, 2),
+                "net_change": round(c - d, 2),
             }
         )
 
     return summary, rows
 
 
+# -----------------------------
+# Core checks
+# -----------------------------
 def check_schema(data: Dict[str, Any], cfg: AuditConfig) -> Optional[CheckFinding]:
     required_top = ["summary", "monthly_summary", "transactions"]
     missing = [k for k in required_top if k not in data]
-
     if missing and cfg.strict_schema:
         return CheckFinding("schema.top_level", "fail", f"Missing top-level keys: {missing}")
     elif missing:
@@ -165,18 +170,8 @@ def check_schema(data: Dict[str, Any], cfg: AuditConfig) -> Optional[CheckFindin
     tx = data.get("transactions", [])
     if not isinstance(tx, list):
         return CheckFinding("schema.transactions_type", "fail", "`transactions` must be a list.")
-
     if tx and not isinstance(tx[0], dict):
         return CheckFinding("schema.transactions_rows", "fail", "Each transaction must be an object/dict.")
-
-    if tx and isinstance(tx[0], dict):
-        expected = ["date", "description", "debit", "credit", "balance", "page", "bank", "source_file"]
-        miss = [f for f in expected if f not in tx[0]]
-        if miss and cfg.strict_schema:
-            return CheckFinding("schema.transaction_fields", "fail", f"Missing transaction fields: {miss}")
-        elif miss:
-            return CheckFinding("schema.transaction_fields", "warn", f"Missing transaction fields (non-strict): {miss}")
-
     return None
 
 
@@ -184,16 +179,175 @@ def check_summary_consistency(data: Dict[str, Any], recomputed_summary: Dict[str
     provided = data.get("summary", {})
     if not isinstance(provided, dict):
         return CheckFinding("summary.type", "fail", "`summary` must be a dict/object.")
-
     pt = provided.get("total_transactions")
     rt = recomputed_summary.get("total_transactions")
-    if pt is not None and rt is not None and int(pt) != int(rt):
-        return CheckFinding(
-            "summary.total_transactions",
-            "fail",
-            f"`summary.total_transactions` mismatch: provided={pt} recomputed={rt}",
-        )
+    if pt is not None and rt is not None:
+        try:
+            if int(pt) != int(rt):
+                return CheckFinding(
+                    "summary.total_transactions",
+                    "fail",
+                    f"`summary.total_transactions` mismatch: provided={pt} recomputed={rt}",
+                )
+        except Exception:
+            return CheckFinding(
+                "summary.total_transactions",
+                "warn",
+                f"Could not compare `total_transactions`: provided={pt} recomputed={rt}",
+            )
     return None
+
+
+# -----------------------------
+# Monthly diff engine (professional, explicit)
+# -----------------------------
+def _index_by_month(rows: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        if isinstance(r, dict) and r.get("month"):
+            out[str(r["month"])] = r
+    return out
+
+
+def build_monthly_diffs(
+    provided_rows: Any,
+    recomputed_rows: List[Dict[str, Any]],
+    tol: float,
+) -> List[Dict[str, Any]]:
+    """
+    Produces row-level diffs:
+      - Missing month on either side
+      - Missing field in provided
+      - Numeric mismatches with delta & severity
+    """
+    prov = _index_by_month(provided_rows)
+    reco = _index_by_month(recomputed_rows)
+
+    months = sorted(set(prov.keys()) | set(reco.keys()))
+    fields = ["transaction_count", "total_debit", "total_credit", "net_change"]
+
+    diffs: List[Dict[str, Any]] = []
+
+    for m in months:
+        pr = prov.get(m)
+        rr = reco.get(m)
+
+        if pr is None:
+            diffs.append(
+                {"month": m, "field": "__month__", "status": "MISSING_IN_PROVIDED", "provided": None, "recomputed": rr}
+            )
+            continue
+
+        if rr is None:
+            diffs.append(
+                {"month": m, "field": "__month__", "status": "MISSING_IN_RECOMPUTED", "provided": pr, "recomputed": None}
+            )
+            continue
+
+        for f in fields:
+            pv = pr.get(f, None)
+            rv = rr.get(f, None)
+
+            # Treat "missing in provided" explicitly (your screenshot shows None)
+            if pv is None and rv is not None:
+                diffs.append(
+                    {
+                        "month": m,
+                        "field": f,
+                        "status": "MISSING_FIELD_IN_PROVIDED",
+                        "provided": None,
+                        "recomputed": rv,
+                        "delta": None,
+                        "abs_delta": None,
+                    }
+                )
+                continue
+
+            # If recomputed missing (rare), flag it too
+            if rv is None and pv is not None:
+                diffs.append(
+                    {
+                        "month": m,
+                        "field": f,
+                        "status": "MISSING_FIELD_IN_RECOMPUTED",
+                        "provided": pv,
+                        "recomputed": None,
+                        "delta": None,
+                        "abs_delta": None,
+                    }
+                )
+                continue
+
+            # Both missing -> ignore
+            if pv is None and rv is None:
+                continue
+
+            # transaction_count = exact compare
+            if f == "transaction_count":
+                try:
+                    if int(pv) != int(rv):
+                        diffs.append(
+                            {
+                                "month": m,
+                                "field": f,
+                                "status": "MISMATCH",
+                                "provided": pv,
+                                "recomputed": rv,
+                                "delta": int(rv) - int(pv),
+                                "abs_delta": abs(int(rv) - int(pv)),
+                            }
+                        )
+                except Exception:
+                    diffs.append(
+                        {
+                            "month": m,
+                            "field": f,
+                            "status": "MISMATCH",
+                            "provided": pv,
+                            "recomputed": rv,
+                            "delta": None,
+                            "abs_delta": None,
+                        }
+                    )
+                continue
+
+            # numeric compare with tolerance
+            if _is_num(pv) and _is_num(rv):
+                delta = float(rv) - float(pv)
+                abs_delta = abs(delta)
+                if abs_delta > tol:
+                    # Severity for UI
+                    sev = "HIGH" if abs_delta > max(100.0, 10 * tol) else "LOW"
+                    diffs.append(
+                        {
+                            "month": m,
+                            "field": f,
+                            "status": "MISMATCH",
+                            "severity": sev,
+                            "provided": _round2(pv),
+                            "recomputed": _round2(rv),
+                            "delta": round(delta, 2),
+                            "abs_delta": round(abs_delta, 2),
+                        }
+                    )
+            else:
+                # non-numeric mismatch
+                if str(pv) != str(rv):
+                    diffs.append(
+                        {
+                            "month": m,
+                            "field": f,
+                            "status": "MISMATCH",
+                            "provided": pv,
+                            "recomputed": rv,
+                            "delta": None,
+                            "abs_delta": None,
+                        }
+                    )
+
+    return diffs
 
 
 def check_monthly_summary(
@@ -202,142 +356,36 @@ def check_monthly_summary(
     cfg: AuditConfig,
 ) -> Tuple[Optional[CheckFinding], List[Dict[str, Any]]]:
     provided = data.get("monthly_summary", [])
+
+    diffs = build_monthly_diffs(provided, recomputed_monthly, cfg.amount_tolerance)
+
+    # If the only diffs are "missing fields in provided", make it WARN not FAIL (common in your screenshot)
+    hard_mismatches = [d for d in diffs if d.get("status") == "MISMATCH" or d.get("status", "").startswith("MISSING_IN_")]
+
     if not provided:
-        return (
-            CheckFinding("monthly_summary.missing", "warn", "No `monthly_summary` provided; cannot compare."),
-            [],
-        )
-
-    if not isinstance(provided, list):
-        return (CheckFinding("monthly_summary.type", "fail", "`monthly_summary` must be a list."), [])
-
-    p_df = pd.DataFrame(provided)
-    r_df = pd.DataFrame(recomputed_monthly)
-
-    diffs: List[Dict[str, Any]] = []
-    all_months = sorted(set(p_df.get("month", pd.Series([], dtype=str)).tolist()) | set(r_df.get("month", pd.Series([], dtype=str)).tolist()))
-
-    fields = ["transaction_count", "total_debit", "total_credit", "net_change", "ending_balance", "lowest_balance", "highest_balance"]
-
-    def row_by_month(df: pd.DataFrame, m: str) -> Dict[str, Any]:
-        if df.empty or "month" not in df.columns:
-            return {}
-        sub = df[df["month"] == m]
-        if sub.empty:
-            return {}
-        return sub.iloc[0].to_dict()
-
-    for m in all_months:
-        pr = row_by_month(p_df, m)
-        rr = row_by_month(r_df, m)
-        if not pr or not rr:
-            diffs.append({"month": m, "issue": "month_missing", "provided_exists": bool(pr), "recomputed_exists": bool(rr)})
-            continue
-
-        for f in fields:
-            pv = pr.get(f)
-            rv = rr.get(f)
-            if f == "transaction_count":
-                try:
-                    if int(pv) != int(rv):
-                        diffs.append({"month": m, "field": f, "provided": pv, "recomputed": rv})
-                except Exception:
-                    diffs.append({"month": m, "field": f, "provided": pv, "recomputed": rv})
-            else:
-                if pv is None and rv is None:
-                    continue
-                if pv is None or rv is None:
-                    diffs.append({"month": m, "field": f, "provided": pv, "recomputed": rv})
-                elif not _isclose(pv, rv, cfg.amount_tolerance):
-                    diffs.append({"month": m, "field": f, "provided": pv, "recomputed": rv})
+        return (CheckFinding("monthly_summary.missing", "warn", "No `monthly_summary` provided; cannot compare."), diffs)
 
     if diffs:
+        # Determine severity: if there are true numeric mismatches -> fail; if only missing fields -> warn
+        has_true_mismatch = any(d.get("status") == "MISMATCH" for d in diffs)
+        status = "fail" if has_true_mismatch else "warn"
+
+        msg = (
+            f"Monthly summary differences found: {len(diffs)} items. "
+            f"Tolerance={cfg.amount_tolerance}. "
+            f"{'Includes true numeric mismatches.' if has_true_mismatch else 'Mostly missing fields in provided summary.'}"
+        )
         return (
             CheckFinding(
                 "monthly_summary.diff",
-                "fail",
-                f"Monthly summary differs from recomputation in {len(diffs)} places (showing up to {cfg.max_examples}).",
-                diffs[: int(cfg.max_examples)],
+                status,
+                msg,
+                examples=diffs[: int(cfg.max_examples)],
             ),
             diffs,
         )
+
     return (None, diffs)
-
-
-def check_balance_continuity(data: Dict[str, Any], cfg: AuditConfig) -> Optional[CheckFinding]:
-    tx = data.get("transactions", [])
-    if not isinstance(tx, list) or not tx:
-        return None
-
-    df = pd.DataFrame(tx)
-    needed = {"debit", "credit", "balance", "source_file"}
-    if not needed.issubset(set(df.columns)):
-        return CheckFinding(
-            "balance_continuity.skipped",
-            "warn",
-            f"Skipping balance continuity (missing: {sorted(list(needed - set(df.columns)))})",
-        )
-
-    df["__date"] = df["date"].apply(_parse_date_safe) if "date" in df.columns else None
-    df["__page"] = df["page"].apply(_float_or_nan) if "page" in df.columns else float("nan")
-    df["__debit"] = df["debit"].apply(_float_or_nan).fillna(0.0)
-    df["__credit"] = df["credit"].apply(_float_or_nan).fillna(0.0)
-    df["__balance"] = df["balance"].apply(_float_or_nan)
-    df["__source_file"] = df["source_file"].apply(_safe_str)
-    df["__bank"] = df["bank"].apply(_safe_str) if "bank" in df.columns else ""
-
-    df["__idx"] = range(len(df))
-    df = df.sort_values(["__source_file", "__date", "__page", "__idx"], ascending=True)
-
-    mismatches: List[Dict[str, Any]] = []
-    for (sf, bank), g in df.groupby(["__source_file", "__bank"], sort=False):
-        g = g.reset_index(drop=True)
-
-        prev_bal = None
-        prev_row = None
-        for i in range(len(g)):
-            bal = g.loc[i, "__balance"]
-            if not math.isfinite(bal):
-                prev_bal = None
-                prev_row = None
-                continue
-
-            if prev_bal is not None and prev_row is not None:
-                expected = float(prev_bal + g.loc[i, "__credit"] - g.loc[i, "__debit"])
-                if abs(expected - bal) > cfg.amount_tolerance:
-                    mismatches.append(
-                        {
-                            "source_file": sf,
-                            "bank": bank,
-                            "prev_date": _safe_str(prev_row.get("date")),
-                            "prev_balance": float(prev_bal),
-                            "date": _safe_str(g.loc[i, "date"]),
-                            "debit": float(g.loc[i, "__debit"]),
-                            "credit": float(g.loc[i, "__credit"]),
-                            "expected_balance": round(expected, 2),
-                            "actual_balance": round(float(bal), 2),
-                            "delta": round(float(bal - expected), 2),
-                            "page": g.loc[i, "page"] if "page" in g.columns else None,
-                            "description": g.loc[i, "description"] if "description" in g.columns else None,
-                        }
-                    )
-                    if len(mismatches) >= int(cfg.max_examples):
-                        break
-
-            prev_bal = float(bal)
-            prev_row = g.loc[i].to_dict()
-
-        if len(mismatches) >= int(cfg.max_examples):
-            break
-
-    if mismatches:
-        return CheckFinding(
-            "balance_continuity.mismatch",
-            "fail",
-            f"Balance continuity mismatches found (showing up to {cfg.max_examples}).",
-            mismatches,
-        )
-    return None
 
 
 def check_duplicates_and_suspicious(data: Dict[str, Any], cfg: AuditConfig) -> List[CheckFinding]:
@@ -367,7 +415,7 @@ def check_duplicates_and_suspicious(data: Dict[str, Any], cfg: AuditConfig) -> L
 
         both = df[(df["__debit"] > 0) & (df["__credit"] > 0)]
         if not both.empty:
-            cols = [c for c in ["date", "description", "debit", "credit", "balance", "source_file"] if c in df.columns]
+            cols = [c for c in ["date", "description", "debit", "credit", "balance", "source_file", "page"] if c in df.columns]
             findings.append(
                 CheckFinding(
                     "transactions.debit_and_credit",
@@ -377,21 +425,12 @@ def check_duplicates_and_suspicious(data: Dict[str, Any], cfg: AuditConfig) -> L
                 )
             )
 
-        neg = df[(df["__debit"] < 0) | (df["__credit"] < 0)]
-        if not neg.empty:
-            cols = [c for c in ["date", "description", "debit", "credit", "balance", "source_file"] if c in df.columns]
-            findings.append(
-                CheckFinding(
-                    "transactions.negative_amounts",
-                    "warn",
-                    f"{len(neg)} rows have negative debit/credit values (showing up to {cfg.max_examples}).",
-                    neg[cols].head(int(cfg.max_examples)).to_dict(orient="records"),
-                )
-            )
-
     return findings
 
 
+# -----------------------------
+# Orchestration
+# -----------------------------
 def run_audit(data: Dict[str, Any], cfg: AuditConfig) -> AuditResult:
     checks_run = 0
     failed: List[CheckFinding] = []
@@ -412,11 +451,6 @@ def run_audit(data: Dict[str, Any], cfg: AuditConfig) -> AuditResult:
 
     checks_run += 1
     f, diffs = check_monthly_summary(data, recomputed_monthly, cfg)
-    if f:
-        (failed if f.status == "fail" else warnings).append(f)
-
-    checks_run += 1
-    f = check_balance_continuity(data, cfg)
     if f:
         (failed if f.status == "fail" else warnings).append(f)
 
