@@ -12,6 +12,33 @@ from audit_checks import AuditConfig, audit_report_json, run_audit
 
 st.set_page_config(page_title="Statement Audit", layout="wide")
 
+AUTH_USERNAME = "user"
+AUTH_PASSWORD = "xs2user"
+
+
+def _show_login() -> None:
+    st.title("Sign in")
+    st.caption("Please login to access the Statement Audit console.")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", type="primary")
+
+    if submitted:
+        if username == AUTH_USERNAME and password == AUTH_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if not st.session_state["authenticated"]:
+    _show_login()
+    st.stop()
+
 st.markdown(
     """
     <style>
@@ -46,6 +73,12 @@ st.markdown(
 )
 
 with st.sidebar:
+    st.success(f"Signed in as {AUTH_USERNAME}")
+    if st.button("Logout"):
+        st.session_state["authenticated"] = False
+        st.rerun()
+
+    st.divider()
     st.header("Input Source")
     input_mode = st.radio(
         "Choose input mode",
